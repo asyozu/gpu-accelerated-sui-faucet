@@ -54,10 +54,11 @@ std::wstring utf8_to_wide(const std::string& text) {
 
 }  // namespace
 
-std::string http_post_json(const std::string& url,
-                           const std::string& body,
-                           const std::string& extra_headers,
-                           const HttpOptions& options) {
+static std::string http_request(const std::string& url,
+                                const wchar_t* method,
+                                const std::string& body,
+                                const std::string& extra_headers,
+                                const HttpOptions& options) {
     if (options.proxy.empty() &&
         (!options.proxy_username.empty() || !options.proxy_password.empty())) {
         throw std::invalid_argument(
@@ -102,7 +103,7 @@ std::string http_post_json(const std::string& url,
     }
     const DWORD flags = components.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0;
     InternetHandle request(WinHttpOpenRequest(connection.get(),
-                                              L"POST",
+                                              method,
                                               path.c_str(),
                                               nullptr,
                                               WINHTTP_NO_REFERER,
@@ -177,6 +178,17 @@ std::string http_post_json(const std::string& url,
         throw std::runtime_error("HTTP " + std::to_string(status) + ": " + response);
     }
     return response;
+}
+
+std::string http_post_json(const std::string& url,
+                           const std::string& body,
+                           const std::string& extra_headers,
+                           const HttpOptions& options) {
+    return http_request(url, L"POST", body, extra_headers, options);
+}
+
+std::string http_get(const std::string& url, const HttpOptions& options) {
+    return http_request(url, L"GET", {}, {}, options);
 }
 
 }  // namespace sui_pow

@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
@@ -20,10 +22,7 @@
 
 namespace {
 
-constexpr std::string_view kChallengeApi =
-    "https://faucet.testnet.sui.io/v2/request_challenge";
-constexpr std::string_view kFaucetApi =
-    "https://faucet.testnet.sui.io/v2/faucet_web_gas";
+constexpr std::string_view kFaucetUrl = "https://faucet.testnet.sui.io";
 
 class Arguments {
 public:
@@ -90,7 +89,8 @@ private:
 
 sui_pow::MineOptions parse_options(const Arguments& args) {
     sui_pow::MineOptions options;
-    options.batch_size = args.number<std::uint64_t>("--batch-size", 16'777'216);
+    options.progress_interval = args.number<std::uint64_t>("--progress-interval", 100);
+    options.batch_size = args.number<std::uint32_t>("--batch-size", 128);
     options.cuda_device = args.number<int>("--device", 0);
     options.quiet = args.flag("--quiet");
     return options;
@@ -219,23 +219,16 @@ sui_pow::HttpOptions parse_http_options(const Arguments& args) {
 
 sui_pow::MineRequest parse_mine_request(const Arguments& args) {
     sui_pow::MineRequest request;
-    request.ts = args.number<std::uint64_t>("--ts", 0);
-    if (!args.optional("--ts")) {
-        throw std::invalid_argument("missing required option --ts");
-    }
-    const auto difficulty = args.number<unsigned int>("--difficulty", 0);
-    if (!args.optional("--difficulty") || difficulty > 128) {
-        throw std::invalid_argument("--difficulty must be between 3 and 128");
-    }
-    request.difficulty = static_cast<std::uint16_t>(difficulty);
-    request.challenge = args.required("--challenge");
+    request.chain_id = args.required("--chain-id");
+    request.checkpoint_seq = args.required("--checkpoint-seq");
+    request.checkpoint_digest = args.required("--checkpoint-digest");
+    request.random_bytes = args.required("--random-bytes");
+    request.faucet_address = args.required("--faucet-address");
+    request.recipient = args.required("--recipient");
+    request.threshold = args.number<std::uint64_t>("--threshold", 0);
     request.start_nonce = args.number<std::uint64_t>("--start", 0);
-    if (request.start_nonce >= sui_pow::kNonceSpace) {
-        throw std::invalid_argument("--start must fit in the u32 nonce space");
-    }
-    const auto available = sui_pow::kNonceSpace - request.start_nonce;
-    const auto count = args.number<std::uint64_t>("--count", available);
-    request.end_nonce = request.start_nonce + std::min(count, available);
+    request.nonce_count = args.number<std::uint64_t>(
+        "--count", std::numeric_limits<std::uint64_t>::max());
     return request;
 }
 
@@ -258,52 +251,98 @@ void run_mine(const Arguments& args) {
     print_solution(sui_pow::mine(request, options));
 }
 
+std::string json_text_field(std::string_view object, std::string_view key) {
+    return sui_pow::json_lite::decode_string(
+        sui_pow::json_lite::find_field(object, key));
+}
+
+std::string normalize_address(std::string address) {
+    if (address.rfind("0x", 0) != 0 || address.size() < 3 || address.size() > 66) {
+        throw std::invalid_argument("recipient must be a Sui address with 1 to 64 hex digits");
+    }
+    address.erase(0, 2);
+    for (auto& digit : address) {
+        if (!std::isxdigit(static_cast<unsigned char>(digit))) {
+            throw std::invalid_argument("recipient contains a non-hexadecimal character");
+        }
+        digit = static_cast<char>(std::tolower(static_cast<unsigned char>(digit)));
+    }
+    return "0x" + std::string(64 - address.size(), '0') + address;
+}
+
+void validate_v3_challenge(std::string_view challenge, const std::string& recipient) {
+    const auto require_number = [&](std::string_view key, std::uint64_t expected) {
+        if (sui_pow::json_lite::parse_u64(
+                sui_pow::json_lite::find_field(challenge, key)) != expected) {
+            throw std::runtime_error("unsupported v3 challenge parameter: " +
+                                     std::string(key));
+        }
+    };
+    const auto require_text = [&](std::string_view key, std::string_view expected) {
+        if (json_text_field(challenge, key) != expected) {
+            throw std::runtime_error("unsupported v3 challenge parameter: " +
+                                     std::string(key));
+        }
+    };
+    require_number("version", 1);
+    require_text("domain", "sui-faucet-pow/1");
+    require_text("algorithm", "argon2d");
+    require_number("argon2Version", 19);
+    require_number("memorySize", 8192);
+    require_number("iterations", 1);
+    require_number("parallelism", 1);
+    require_number("hashLength", 32);
+    require_text("salt", "sui-faucet-pow-1");
+    require_text("recipient", recipient);
+}
+
 void run_faucet(const Arguments& args) {
-    const auto recipient = args.required("--recipient");
+    const auto recipient = normalize_address(args.required("--recipient"));
     const auto options = parse_options(args);
     const auto tries = args.number<std::uint64_t>("--try", 1);
     if (tries == 0) {
         throw std::invalid_argument("--try must be at least 1");
     }
-
     auto run_once = [&](const sui_pow::HttpOptions& http_options,
                         const std::string& label) {
-        const auto response = sui_pow::http_post_json(
-            std::string(kChallengeApi), "{}", {}, http_options);
-        const auto challenge_object =
-            sui_pow::json_lite::find_field(response, "challenge");
-        const auto signature = sui_pow::json_lite::find_field(response, "signature");
+        const auto challenge_response = sui_pow::http_get(
+            std::string(kFaucetUrl) + "/v3/challenge?recipient=" + recipient,
+            http_options);
+        validate_v3_challenge(challenge_response, recipient);
 
         sui_pow::MineRequest request;
-        request.ts = sui_pow::json_lite::parse_u64(
-            sui_pow::json_lite::find_field(challenge_object, "ts"));
-        const auto difficulty = sui_pow::json_lite::parse_u64(
-            sui_pow::json_lite::find_field(challenge_object, "difficulty"));
-        if (difficulty > 128) {
-            throw std::runtime_error("challenge difficulty is outside the supported range");
-        }
-        request.difficulty = static_cast<std::uint16_t>(difficulty);
-        request.challenge = sui_pow::json_lite::decode_string(
-            sui_pow::json_lite::find_field(challenge_object, "challenge"));
+        request.chain_id = json_text_field(challenge_response, "chainId");
+        request.checkpoint_seq = json_text_field(challenge_response, "checkpointSeq");
+        request.checkpoint_digest = json_text_field(challenge_response, "checkpointDigest");
+        request.random_bytes = json_text_field(challenge_response, "randomBytes");
+        request.faucet_address = json_text_field(challenge_response, "faucetAddress");
+        request.recipient = recipient;
+        request.threshold = sui_pow::json_lite::parse_u64(
+            sui_pow::json_lite::find_field(challenge_response, "threshold"));
+        static_cast<void>(sui_pow::json_lite::parse_u64(request.checkpoint_seq));
 
-        std::cerr << label << " challenge: " << request.challenge
-                  << " (ts: " << request.ts << ", difficulty: " << request.difficulty
-                  << ")\n";
+        std::cerr << label << " checkpoint " << request.checkpoint_seq
+                  << " | threshold " << request.threshold << '\n';
         const auto solution = sui_pow::mine(request, options);
-
+        std::cerr << "Proof found: nonce " << solution.nonce << " after "
+              << solution.attempts << " hashes in " << std::fixed
+              << std::setprecision(2) << solution.elapsed_seconds
+              << " s; submitting to faucet...\n";
         const std::string payload =
-            "{\"FixedAmountRequest\":{\"recipient\":" +
-            sui_pow::json_lite::escape_string(recipient) +
-            ",\"solution\":{\"nonce\":" + std::to_string(solution.nonce) +
-            ",\"hash\":" + sui_pow::json_lite::escape_string(solution.hash) +
-            ",\"challenge\":" + std::string(challenge_object) +
-            ",\"signature\":" + std::string(signature) + "}}}";
-
+            "{\"recipient\":" + sui_pow::json_lite::escape_string(recipient) +
+            ",\"checkpointSeq\":" +
+            sui_pow::json_lite::escape_string(request.checkpoint_seq) +
+            ",\"nonce\":" + sui_pow::json_lite::escape_string(
+                                     std::to_string(solution.nonce)) +
+            ",\"hashHex\":" + sui_pow::json_lite::escape_string(solution.hash) + "}";
+        const auto submit_started = std::chrono::steady_clock::now();
         const auto faucet_response = sui_pow::http_post_json(
-            std::string(kFaucetApi),
-            payload,
-            "Origin: https://faucet.sui.io\r\nReferer: https://faucet.sui.io/\r\n",
-            http_options);
+            std::string(kFaucetUrl) + "/v3/gas", payload, {}, http_options);
+        const auto submit_elapsed = std::chrono::duration<double>(
+                                        std::chrono::steady_clock::now() - submit_started)
+                                        .count();
+        std::cerr << "Faucet responded in " << std::fixed << std::setprecision(2)
+                  << submit_elapsed << " s.\n";
         std::cout << label << "\n" << faucet_response << '\n';
     };
 
@@ -323,7 +362,6 @@ void run_faucet(const Arguments& args) {
         http_options.proxy = sui_pow::normalize_http_proxy(parsed_proxy.first);
         http_options.proxy_username = parsed_proxy.second.first;
         http_options.proxy_password = parsed_proxy.second.second;
-
         for (std::uint64_t attempt = 0; attempt < tries; ++attempt) {
             run_once(http_options,
                      "proxy " + *proxied_value + " attempt " +
@@ -337,14 +375,12 @@ void run_faucet(const Arguments& args) {
         std::cout << "No proxies found in proxies.txt; created a new empty file.\n";
         return;
     }
-
     for (const auto& proxy_value : proxy_values) {
         const auto parsed_proxy = parse_proxy_value(proxy_value);
         sui_pow::HttpOptions http_options;
         http_options.proxy = sui_pow::normalize_http_proxy(parsed_proxy.first);
         http_options.proxy_username = parsed_proxy.second.first;
         http_options.proxy_password = parsed_proxy.second.second;
-
         for (std::uint64_t attempt = 0; attempt < tries; ++attempt) {
             run_once(http_options,
                      "proxy " + proxy_value + " attempt " +
@@ -353,33 +389,59 @@ void run_faucet(const Arguments& args) {
     }
 }
 
-void self_test(const Arguments& args) {
-    const std::string expected_solution =
-        "000f018401dcc5a1bad32216583c488c75da95f160a5a730d252e8a87d9c862fd"
-        "6e2b5580df624d3a270dbdbb65fc36caf9fc6383ac8f40c7bbd6c3449fac158";
-
+void self_test() {
     sui_pow::MineRequest request;
-    request.ts = 1'700'000'000'000ULL;
-    request.difficulty = 3;
-    request.challenge = "abc";
-    request.start_nonce = 386;
-    request.end_nonce = 387;
+    request.chain_id = "8wWZfv1HjQxjB5ncmC9CQqqRqUMBiEZXnc5FhS9zRe1v";
+    request.checkpoint_seq = "1713342";
+    request.checkpoint_digest = "GzBdc9tbUe3s2PK1iVJcyQBj5TvdX7bJiAHWbhBDYiYb";
+    request.random_bytes =
+        "mJ4ZqDXQasy17GTiGfp0/OYAGCR+7reLM5+Gb39YtoAIaPuh1wj+z5J7po+eSze3";
+    request.faucet_address =
+        "0x949cd75a2485cc18b8258634ffd9b849a687e2e2a0b4c2444a21f007fc79adc4";
+    request.recipient =
+        "0x1111111111111111111111111111111111111111111111111111111111111111";
+    request.threshold = 72'057'594'037'927'936ULL;
+    request.start_nonce = 201;
+    request.nonce_count = 1;
 
     sui_pow::MineOptions options;
-    options.cuda_device = args.number<int>("--device", 0);
-    options.batch_size = 1;
     options.quiet = true;
+    options.batch_size = 1;
     const auto result = sui_pow::mine(request, options);
-    if (result.nonce != 386 || result.hash != expected_solution) {
-        throw std::runtime_error("CUDA/WASM parity vector failed");
+    if (result.nonce != 201 ||
+        result.hash != "0008faf113e0b071f5f9d5d6e1dc9321890ecb7e81059f07dedbd3dec5e902bb") {
+        throw std::runtime_error("Argon2d v3 conformance vector failed");
     }
 
-    const std::string sample =
-        R"({"challenge":{"challenge":"abc","ts":1700000000000,"difficulty":3},"signature":"sig"})";
+    request.threshold = 10'780'597'955'806'233'528ULL;
+    request.start_nonce = 42;
+    request.nonce_count = 1;
+    options.batch_size = 64;
+    const auto second_vector = sui_pow::mine(request, options);
+    if (second_vector.nonce != 42 ||
+        second_vector.hash != "959c60b9062203b7739fb94aa3577a6173fa36f0cec60e55ce714402b36ffa28") {
+        throw std::runtime_error("Argon2d GPU batch vector failed");
+    }
+
+    request.random_bytes.clear();
+    request.threshold = std::numeric_limits<std::uint64_t>::max();
+    request.start_nonce = 0;
+    options.batch_size = 1;
+    const auto empty_random_result = sui_pow::mine(request, options);
+    if (empty_random_result.hash !=
+        "d8430e5471f4fba3c3c67a253f15dc72588d87c364117e1f138e26387050ec60") {
+        throw std::runtime_error("Argon2d empty-randomness vector failed");
+    }
+
+    const std::string sample = R"({"challenge":{"chainId":"abc","checkpointSeq":"42"}})";
     const auto object = sui_pow::json_lite::find_field(sample, "challenge");
     if (sui_pow::json_lite::decode_string(
-            sui_pow::json_lite::find_field(object, "challenge")) != "abc") {
+            sui_pow::json_lite::find_field(object, "chainId")) != "abc") {
         throw std::runtime_error("JSON parser self-test failed");
+    }
+    if (sui_pow::json_lite::parse_u64(
+            sui_pow::json_lite::find_field(object, "checkpointSeq")) != 42) {
+        throw std::runtime_error("JSON integer parser self-test failed");
     }
     if (sui_pow::normalize_http_proxy("http://127.0.0.1:8080/") !=
         "127.0.0.1:8080") {
@@ -395,20 +457,23 @@ void self_test(const Arguments& args) {
         throw std::runtime_error("HTTP proxy parser accepted SOCKS unexpectedly");
     } catch (const std::invalid_argument&) {
     }
-    std::cout << "self-test passed: CUDA kernel matches wasm_pow_bg.wasm\n";
+    std::cout << "self-test passed: Argon2d v3 conformance vectors\n";
 }
 
 void print_help() {
     std::cout
-        << "sui-pow GPU-only C++/CUDA\n\n"
+        << "sui-pow C++ faucet PoW client\n\n"
         << "Commands:\n"
-        << "  sui-pow mine --ts N --difficulty N --challenge TEXT [options]\n"
+        << "  sui-pow mine --chain-id ID --checkpoint-seq N --checkpoint-digest D\n"
+        << "               --random-bytes B64 --faucet-address 0xADDRESS\n"
+        << "               --recipient 0xADDRESS --threshold N [options]\n"
         << "  sui-pow faucet --recipient 0xADDRESS [options]\n"
         << "  sui-pow self-test\n\n"
         << "Options:\n"
-        << "  --device N                    CUDA device, default: 0\n"
-        << "  --batch-size N                CUDA launch size, default: 16777216\n"
         << "  --start N --count N           restrict nonce range\n"
+        << "  --progress-interval N         progress update interval, default: 100 hashes\n"
+        << "  --batch-size N                GPU jobs per batch, power of two, default: 128\n"
+        << "  --device N                    CUDA device index, default: 0\n"
         << "  --proxy HOST:PORT[:USER:PASS] optional explicit proxy override\n"
         << "  --try N                       repeat direct attempts N times; with --proxy, repeat each proxy N times\n"
         << "  --quiet                       hide progress\n";
@@ -429,7 +494,7 @@ int main(int argc, char** argv) {
         } else if (command == "faucet") {
             run_faucet(args);
         } else if (command == "self-test") {
-            self_test(args);
+            self_test();
         } else if (command == "help" || command == "--help" || command == "-h") {
             print_help();
         } else {

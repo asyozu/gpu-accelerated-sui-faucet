@@ -1,123 +1,79 @@
-# sui-pow GPU-only
+# Sui Faucet PoW Client
 
-A C++17/CUDA implementation dedicated strictly to PoW mining on NVIDIA GPUs. The CPU miner, AVX2 support, scalar BLAKE2b, and fallback mechanisms have been completely removed. The CPU only performs mandatory host-side CUDA orchestration: calling APIs, parsing JSON/HTTP, launching kernels, and retrieving solutions.
+A C++17/CUDA client for the public Sui faucet v3 automation API. It fetches a recipient-bound challenge, computes Argon2d proofs on an NVIDIA GPU, and submits the exact proof fields required by `/v3/gas`.
 
-## Verified Algorithm
+## Proof Protocol
+
+The client implements proof version 1. The password is the following eight UTF-8 fields joined with newline characters and no trailing newline:
 
 ```text
-message = decimal(ts) + ":" + decimal(nonce) + ":" + decimal(difficulty) + ":" + challenge
-first   = lowercase_hex(BLAKE2b-512(UTF-8(message)))
-hash    = lowercase_hex(BLAKE2b-512(ASCII(first)))
-valid   = hash has at least `difficulty` consecutive leading '0' characters
+sui-faucet-pow/1
+<chainId>
+<checkpointSeq>
+<checkpointDigest>
+<randomBytes>
+<faucetAddress>
+<recipient>
+<nonce>
 ```
 
-Both BLAKE2b passes run within the same CUDA thread. Intermediate digests are never copied back to the CPU; each batch only checks a `found` flag. The winning nonce and 64-byte digest are transferred to the host only when a valid solution is found.
+It hashes this preimage with Argon2d v=19, 8192 KiB, one iteration, one lane, salt `sui-faucet-pow-1`, and a 32-byte output. The first eight output bytes are interpreted as a big-endian unsigned integer; a proof is accepted locally when that value is below the challenge's `threshold`. The full 32-byte result is submitted as 64 lowercase hexadecimal characters.
 
-## GTX 1660 Super Kernel
+Challenge hashing parameters are checked before mining. Unknown versions or parameter changes are rejected rather than silently producing incompatible proofs. The CUDA kernel and host-side block initialization are from [WebDollar/argon2-gpu](https://github.com/WebDollar/argon2-gpu), pinned to commit `f5fce223d16769f202449c9b0837ad3533304acd`; the selected source files are covered by its MIT license, reproduced in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-The project retains a single kernel verified for `sm_75`. It uses native `uint64_t` BLAKE2b operations and preserves the twelve rounds inside an actual loop (`#pragma unroll 1`). Compiled with CUDA 13.3 on a GTX 1660 Super, the kernel consumes 168 registers, a 512-byte stack frame, produces zero spills, and achieves **333.04 MH/s** at a batch size of `16777216`.
-
-Experimental direct-word and `uint32_t` pair implementations have been removed: direct-word only reached **214.11 MH/s**, while `uint32_t` pairs failed to outperform the reference kernel and did not match the WASM vector on hardware. Unrolled variants, register-clamping builds, kernel selector enums, and the `--gpu-kernel` option have also been removed. Block size is fixed at `128`; default batch size is `16777216`.
-
-## Building on Windows
+## Build on Windows
 
 Prerequisites:
 
-1. NVIDIA GPU driver.
-2. CUDA Toolkit with `nvcc` (verified on CUDA 13.3).
-3. Visual Studio / Build Tools 2022 with the **Desktop development with C++** workload.
-4. MSVC v143, Windows SDK, and CMake tools for Windows.
+1. NVIDIA GPU with CUDA support and a current driver.
+2. CUDA Toolkit 13.x with `nvcc` (tested with CUDA 13.4 on a GTX 1660 Super).
+3. Visual Studio 2022 Build Tools with the Desktop development with C++ workload.
+4. CMake 3.24 or newer.
+5. Network access during the first configure to download the pinned Argon2 GPU source archive.
 
-Open the **x64 Native Tools Command Prompt for VS 2022**:
+From a Visual Studio Developer PowerShell or Native Tools prompt:
 
-```bat
-cmake -S . -B build-gpu -G "Visual Studio 17 2022" -A x64
-cmake --build build-gpu --config Release
-ctest --test-dir build-gpu -C Release --output-on-failure
+```powershell
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
 ```
 
-The output binary is located at:
+The executable is `build\Release\sui-pow.exe`. CMake targets CUDA architecture `75` for the GTX 1660 Super. `self-test` checks the official v3 vectors on the GPU, including a challenge with empty checkpoint randomness.
 
-```text
-build-gpu\Release\sui-pow.exe
+## Request SUI
+
+```powershell
+build\Release\sui-pow.exe faucet --recipient 0xYOUR_64_HEX_CHARACTER_ADDRESS
 ```
 
-CMake locks the CUDA architecture to `75` (matching the GTX 1660 Super). Verbose `ptxas` output is enabled by default to log register counts, stack frame sizes, spill stores, and spill loads during build time.
+The client uses `https://faucet.testnet.sui.io`. A fresh challenge is fetched for each `--try` attempt; the client does not automatically grind a replacement proof after an uncertain submission.
 
-## GPU Self-Test
+Useful options:
 
-The self-test requires an NVIDIA GPU and validates the kernel against the test vector from `wasm_pow_bg.wasm`:
+- `--try N` requests N independent payouts in sequence; default is 1.
+- `--proxy HOST:PORT[:USER:PASS]` routes challenge and payout calls through an HTTP proxy.
+- `--proxy` without a value reads proxy entries from `proxies.txt` in the current directory.
+- `--progress-interval N` sets the mining progress interval; default is 100 hashes. After solving, the client reports the nonce and mining time, then reports how long the faucet takes to respond.
+- `--batch-size N` sets the number of GPU jobs per batch; it must be a power of two and defaults to 128. Each job reserves 8 MiB of device memory, so the default batch uses about 1 GiB. Reduce it if other GPU applications need memory.
+- `--device N` selects a CUDA device index; default is 0.
+- `--quiet` hides mining progress.
 
-```bat
-build-gpu\Release\sui-pow.exe self-test
+For an uncertain submission, preserve the original endpoint and proof fields. Resolve any returned transaction digest before requesting another payout. See the [Faucet automation guide](https://faucet.sui.io/how-to-use/#automation) and [proof-of-work specification](https://faucet.sui.io/pow-spec/) for protocol details and recovery behavior.
+
+## Standalone Mining
+
+`mine` accepts the public challenge fields directly and emits a JSON solution:
+
+```powershell
+build\Release\sui-pow.exe mine `
+  --chain-id CHAIN_ID `
+  --checkpoint-seq CHECKPOINT_SEQUENCE `
+  --checkpoint-digest CHECKPOINT_DIGEST `
+  --random-bytes RANDOM_BYTES_BASE64 `
+  --faucet-address 0xFAUCET_ADDRESS `
+  --recipient 0xRECIPIENT `
+  --threshold THRESHOLD
 ```
 
-Expected output:
-
-```text
-self-test passed: CUDA kernel matches wasm_pow_bg.wasm
-```
-
-## Running the Faucet
-
-```bat
-sui-pow.exe faucet --recipient 0xYOUR_SUI_ADDRESS
-```
-
-Select a specific CUDA device if necessary:
-
-```bat
-sui-pow.exe faucet --recipient 0xYOUR_SUI_ADDRESS --device 0
-```
-
-### HTTP Proxy
-
-The `--proxy` flag applies to both challenge retrieval and solution submission requests. If omitted, the program falls back to the default Windows automatic proxy configuration.
-
-Unauthenticated proxy:
-
-```bat
-sui-pow.exe faucet --recipient 0xYOUR_SUI_ADDRESS --proxy 127.0.0.1:8080
-```
-
-The `http://` prefix is optional:
-
-```bat
-sui-pow.exe faucet --recipient 0xYOUR_SUI_ADDRESS --proxy http://127.0.0.1:8080
-```
-
-HTTP Basic authentication with inline credentials:
-
-```bat
-sui-pow.exe faucet --recipient 0xYOUR_SUI_ADDRESS --proxy 199.7.142.28:35042:FSYbzM:nUjeyW
-```
-
-The format is `host:port:username:password`.
-
-The client uses WinHTTP's HTTP CONNECT tunneling to reach the two faucet HTTPS endpoints. SOCKS4, SOCKS5, and proxies using the `https://` scheme are not supported. Using a proxy only changes your network routing; it does not bypass recipient-based rate limits or faucet cooldown policies.
-
-## Benchmark
-
-Setting difficulty to `128` will practically guarantee traversing the entire range and printing `nonce range exhausted`; this is standard behavior for benchmark runs.
-
-```bat
-sui-pow.exe mine --ts 1700000000000 --difficulty 128 --challenge abc --count 500000000
-```
-
-The progress output reports the active GPU, total attempts, and current MH/s. The default batch size is `16777216`; if you encounter display stuttering or Windows driver timeout errors (TDR), reduce it to `8388608`, `4194304`, `1048576`, or lower.
-
-To inspect register, stack, and spill statistics without generating a new build directory, pass `--clean-first`:
-
-```bat
-cmake -S . -B build-gpu -G "Visual Studio 17 2022" -A x64
-cmake --build build-gpu --config Release --clean-first --verbose > build.log 2>&1
-findstr /i "ptxas registers spill stack frame" build.log
-```
-
-`findstr` is a separate second command; do not append it directly to the end of `cmake --build` without the pipe operator (`|`).
-
-## Notes
-
-- There is no CPU fallback. Systems without an NVIDIA GPU / CUDA support will not build or run the miner.
-- Removing CPU code streamlines the codebase and eliminates unused branches; it does not inherently increase GPU MH/s.
-- The returned hash difficulty is still verified on the host prior to submitting to the faucet, but it is not re-hashed on the CPU.
+Use `--start N` and `--count N` to restrict the u64 nonce range. `--batch-size` controls GPU occupancy and memory use during standalone mining as well.

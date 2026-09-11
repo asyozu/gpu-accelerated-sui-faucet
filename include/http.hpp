@@ -16,5 +16,7 @@ std::string http_post_json(const std::string& url,
                            const std::string& body,
                            const std::string& extra_headers = {},
                            const HttpOptions& options = {});
+std::string http_get(const std::string& url,
+                     const HttpOptions& options = {});
 
 }  // namespace sui_pow
